@@ -1,19 +1,22 @@
-# 🎈 Blank app template
+# Distribuição Mensal VP (NET=5) — Lote (Streamlit)
 
-A simple Streamlit app template for you to modify!
+Processa **até 100 planilhas** de uma vez (CSV/XLS/XLSX), calcula o **VP** apenas para **NET = 5**, **distribui por mês** entre `Início` e `Término` (opcional: só dias úteis), e exporta **um XLSX por arquivo** em um **ZIP** com relatório.
 
-[![Open in Streamlit](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://blank-app-template.streamlit.app/)
+## ✨ Principais recursos
+- Upload múltiplo (até **100 arquivos** por lote).
+- CSV `,` ou `;` automaticamente; Excel (primeira aba).
+- Cálculo e distribuição mensal do VP (NET=5).
+- Normalização para total **= 100%** por arquivo.
+- Saída **padronizada** (colunas e ordem exigidas).
+- Prévia por arquivo (opcional).
+- Download como **ZIP** com `_report.txt`.
 
-### How to run it on your own machine
+---
 
-1. Install the requirements
+## ✅ Pré-requisitos
+- Python 3.9+  
+- Sistema com build C básico (pandas/openpyxl/xlsxwriter)
 
-   ```
-   $ pip install -r requirements.txt
-   ```
-
-2. Run the app
-
-   ```
-   $ streamlit run streamlit_app.py
-   ```
+### Dependências
+```bash
+pip install streamlit pandas numpy xlsxwriter openpyxl
