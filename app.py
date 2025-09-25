@@ -71,6 +71,22 @@ def split_value_by_month(start, end, value, business_days=False):
         partes.append((first_day_of_month(m), dias, value * (dias / total_dias)))
     return partes
 
+def format_mod_label(m_value):
+    """Formata M como 'MÓD. XX' (0->MÓD. 01; 1->MÓD. 02; etc.)."""
+    if pd.isna(m_value):
+        idx = 0
+    else:
+        s = str(m_value).strip().lower()
+        if s in {"", "nan", "none"}:
+            idx = 0
+        else:
+            try:
+                s = s.replace(",", ".")
+                idx = int(float(s))
+            except Exception:
+                idx = 0
+    return f"MÓD. {idx + 1:02d}"
+
 def to_excel_bytes_single(df, sheet_name="VP_por_Atividade", date_cols=None):
     output = BytesIO()
     with pd.ExcelWriter(output, engine="xlsxwriter", datetime_format="dd/mm/yyyy") as writer:
@@ -117,6 +133,10 @@ def processar(df_in: pd.DataFrame, usar_dias_uteis: bool):
     if "B" not in df.columns:
         df["B"] = pd.NA  # Por quê: manter saída consistente mesmo sem a coluna.
 
+    # Verificar se existe coluna "M" para módulo
+    if "M" not in df.columns:
+        df["M"] = 0  # Valor padrão se não existir a coluna M
+
     net_num = pd.to_numeric(df["NET"], errors="coerce")
     df_net5 = df.loc[net_num == 5].copy()
 
@@ -159,7 +179,7 @@ def processar(df_in: pd.DataFrame, usar_dias_uteis: bool):
     df_mes.drop(columns=["VP_somado", "VP_total", "Dif"], inplace=True)
 
     df_out = df_mes.merge(
-        df_net5_valid[["Nome", "B"]],
+        df_net5_valid[["Nome", "B", "M"]],  # Incluir coluna M
         left_on="Linha_Original", right_index=True, how="left"
     )
 
@@ -172,10 +192,13 @@ def processar(df_in: pd.DataFrame, usar_dias_uteis: bool):
         if abs(resid) > 1e-12:
             df_out.iloc[-1, df_out.columns.get_loc("VP_mes")] += resid
 
+    # Aplicar formatação do módulo (M + 1 formatado como 2 dígitos)
+    df_out["Modulo_Formatado"] = df_out["M"].apply(format_mod_label)
+
     df_final = pd.DataFrame({
-        "Empreendimento + Módulo": [codigo_emp_mod] * len(df_out),
-        "Bloco": df_out["B"],
-        "PEP": "",
+        "Empreendimento": [codigo_emp_mod] * len(df_out),
+        #"Bloco": df_out["B"],
+        "Módulo": df_out["Modulo_Formatado"],  # Substituir PEP por Módulo formatado
         "Atividade": df_out["Nome"],
         "VP PREVISTO": df_out["VP_mes"],
         "Mes Ano": df_out["DataReferencia"]
