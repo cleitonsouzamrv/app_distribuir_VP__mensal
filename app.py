@@ -236,10 +236,12 @@ st.markdown(
     'Observação: Sempre lembrar de marcar a opção "Calcular Custos Preliminares" ao gerar o Cronograma no Nexus.'
 )
 
+# Configuração melhorada do file_uploader
 uploaded_files = st.file_uploader(
-    "Envie os arquivos (.xlsx, .xls ou .csv)",
-    type=[ext.strip(".") for ext in ALLOWED_EXT],
+    "Arraste e solte vários arquivos aqui (.xlsx, .xls ou .csv)",
+    type=["xlsx", "xls", "csv"],
     accept_multiple_files=True,
+    help="Você pode selecionar múltiplos arquivos ou arrastar uma pasta inteira"
 )
 
 c1, c2 = st.columns([1, 2])
@@ -251,18 +253,38 @@ with c2:
 st.divider()
 
 if uploaded_files:
+    # Mostrar estatísticas dos arquivos carregados
+    st.success(f"✅ {len(uploaded_files)} arquivo(s) carregado(s) com sucesso!")
+    
+    # Listar arquivos carregados
+    with st.expander("📁 Arquivos carregados", expanded=True):
+        for i, file in enumerate(uploaded_files, 1):
+            st.write(f"{i}. {file.name} ({file.size / 1024:.1f} KB)")
+    
     if len(uploaded_files) > MAX_FILES:
-        st.error(f"Você enviou {len(uploaded_files)} arquivos; o limite é {MAX_FILES}. Remova alguns e tente novamente.")
+        st.error(f"❌ Você enviou {len(uploaded_files)} arquivos; o limite é {MAX_FILES}. Remova alguns e tente novamente.")
     else:
-        go = st.button(f"Processar {len(uploaded_files)} arquivo(s)")
+        # Botão de processamento mais destacado
+        st.markdown("---")
+        go = st.button(
+            f"🚀 Processar {len(uploaded_files)} arquivo(s)", 
+            type="primary", 
+            use_container_width=True
+        )
+        
         if go:
             results: list[tuple[str, bytes]] = []
             report_lines = []
             progress = st.progress(0)
             total = len(uploaded_files)
 
+            # Adicionar área de status
+            status_placeholder = st.empty()
+            
             for i, up in enumerate(uploaded_files, start=1):
                 fname = up.name
+                status_placeholder.info(f"🔄 Processando {i}/{total}: {fname}")
+                
                 try:
                     df_in = read_any(up)
                     df_out, n_invalid = processar(df_in, usar_dias_uteis=usar_dias_uteis)
@@ -275,33 +297,59 @@ if uploaded_files:
                     out_name = f"{safe_base}__VP_mensal.xlsx"
                     results.append((out_name, excel_bytes))
 
-                    msg = f"[OK] {fname} — linhas NET=5 inválidas ignoradas: {n_invalid}; soma VP={df_out['VP PREVISTO'].sum():.6f}"
+                    msg = f"✅ {fname} — linhas NET=5 inválidas ignoradas: {n_invalid}; soma VP={df_out['VP PREVISTO'].sum():.6f}"
                     report_lines.append(msg)
 
                     if mostrar_previa:
-                        with st.expander(f"Prévia: {fname}"):
+                        with st.expander(f"📊 Prévia: {fname}"):
                             st.dataframe(df_out.head(50), use_container_width=True, hide_index=True)
                             st.caption(f"Soma total VP PREVISTO (deve ser 1.0): {df_out['VP PREVISTO'].sum():.6f}")
                 except Exception as e:
                     # Por quê: não interromper o lote por erro em um arquivo.
-                    report_lines.append(f"[ERRO] {fname} — {e}")
+                    error_msg = f"❌ {fname} — {str(e)}"
+                    report_lines.append(error_msg)
+                    st.error(f"Erro em {fname}: {str(e)}")
 
                 progress.progress(int(i * 100 / total))
 
+            status_placeholder.empty()
+
             if not results and report_lines:
-                st.error("Falha ao processar todos os arquivos. Veja o relatório abaixo.")
+                st.error("❌ Falha ao processar todos os arquivos. Veja o relatório abaixo.")
                 st.text("\n".join(report_lines))
-            else:
+            elif results:
                 ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
                 zip_bytes = build_zip(results, "\n".join(report_lines))
-                st.success(f"Concluído: {len(results)} arquivo(s) processado(s).")
+                
+                st.success(f"🎉 Concluído: {len(results)} arquivo(s) processado(s) com sucesso!")
+                
+                # Botão de download mais destacado
                 st.download_button(
-                    "Baixar ZIP com todos os XLSX",
+                    label="📥 Baixar ZIP com todos os arquivos processados",
                     data=zip_bytes,
                     file_name=f"VP_mensal_lote_{ts}.zip",
                     mime="application/zip",
+                    type="primary",
+                    use_container_width=True
                 )
-                with st.expander("Relatório de processamento"):
+                
+                with st.expander("📋 Relatório detalhado de processamento"):
                     st.text("\n".join(report_lines))
 else:
-    st.info("Envie até 100 planilhas contendo as colunas: index, NET, Nome, Início, Término, Custo e B (Bloco).")
+    st.info("""
+    📌 **Como usar:**
+    1. Arraste e solte vários arquivos Excel/CSV na área acima
+    2. Ou clique em "Browse files" para selecionar múltiplos arquivos (Ctrl+Click)
+    3. Ajuste as configurações se necessário
+    4. Clique no botão "Processar" para gerar o ZIP
+    """)
+
+# Adicionar dicas de uso
+with st.expander("💡 Dicas para carregar múltiplos arquivos"):
+    st.markdown("""
+    - **Windows/Linux**: Selecione múltiplos arquivos com `Ctrl + Click`
+    - **Mac**: Selecione múltiplos arquivos com `Cmd + Click`  
+    - **Arraste e solte**: Você pode arrastar uma pasta inteira ou vários arquivos selecionados
+    - **Formatos suportados**: .xlsx, .xls, .csv
+    - **Limite**: Máximo de 100 arquivos por vez
+    """)
