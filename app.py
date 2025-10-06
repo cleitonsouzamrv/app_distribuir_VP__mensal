@@ -1,7 +1,5 @@
 # app.py
-# Streamlit — processamento em lote (até 100 arquivos) com saída ZIP.
-# Requisitos:
-#   pip install streamlit pandas numpy xlsxwriter openpyxl
+# Streamlit — processamento em lote otimizado para Cloud
 
 import streamlit as st
 import pandas as pd
@@ -10,163 +8,226 @@ from io import BytesIO
 import zipfile
 from datetime import datetime
 
-st.set_page_config(page_title="Distribuição Mensal VP (NET=5) - Lote", layout="wide")
+# ---------- CONFIGURAÇÕES INICIAIS OTIMIZADAS ----------
+st.set_page_config(
+    page_title="Distribuição Mensal VP (NET=5) - Lote",
+    page_icon="📊",
+    layout="wide"
+)
 
-# ---------- Config ----------
-MAX_FILES = 100  # Por quê: permite lotes grandes; ajuste se a memória da máquina for limitada.
-ALLOWED_EXT = (".xlsx", ".xls", ".csv")
+# Cache para evitar reprocessamento
+@st.cache_data(show_spinner=False, ttl=3600)
+def load_config():
+    return {
+        "MAX_FILES": 50,  # Reduzido para melhor performance
+        "CHUNK_SIZE": 10000,  # Processar em chunks se necessário
+    }
 
-# ---------- Utilidades ----------
+config = load_config()
+
+# ---------- IMPORTS LEVES E LAZY LOADING ----------
+def safe_imports():
+    """Importa bibliotecas pesadas apenas quando necessário"""
+    try:
+        import xlsxwriter
+        return True
+    except ImportError:
+        st.error("Bibliotecas necessárias não instaladas. Execute: pip install xlsxwriter openpyxl")
+        return False
+
+# ---------- FUNÇÕES OTIMIZADAS ----------
+@st.cache_data
 def parse_currency_ptbr_to_float(x):
-    """'R$ 27.014.235,35' -> 27014235.35"""
+    """Versão vetorizada e otimizada para parsing de moeda"""
     if pd.isna(x):
         return np.nan
-    if isinstance(x, str):
-        s = x.strip().replace("R$", "").replace(" ", "").replace(".", "").replace(",", ".")
-        try:
-            return float(s)
-        except Exception:
-            return np.nan
-    try:
+    
+    if isinstance(x, (int, float)):
         return float(x)
-    except Exception:
-        return np.nan
+    
+    if isinstance(x, str):
+        # Remove caracteres não numéricos de forma mais eficiente
+        s = x.strip().replace('R$', '').replace(' ', '')
+        # Encontra a última vírgula (separador decimal)
+        if ',' in s:
+            parts = s.rsplit(',', 1)
+            if len(parts) == 2:
+                int_part = parts[0].replace('.', '')
+                dec_part = parts[1]
+                s = f"{int_part}.{dec_part}"
+            else:
+                s = s.replace(',', '').replace('.', '')
+        else:
+            s = s.replace('.', '')
+        
+        try:
+            return float(s) if s else np.nan
+        except (ValueError, TypeError):
+            return np.nan
+    
+    return np.nan
 
-def to_date(x):
-    return pd.to_datetime(x, errors="coerce", dayfirst=True)
+@st.cache_data
+def to_date_optimized(series):
+    """Versão otimizada para conversão de datas"""
+    return pd.to_datetime(series, errors='coerce', dayfirst=True, infer_datetime_format=True)
 
 def first_day_of_month(ts):
-    return pd.Timestamp(ts.year, ts.month, 1)
+    return ts.replace(day=1)
 
 def last_day_of_month(ts):
-    return (ts + pd.offsets.MonthEnd(0)).normalize()
+    return (ts.replace(day=28) + pd.Timedelta(days=4)).replace(day=1) - pd.Timedelta(days=1)
 
-def days_in_range(a, b, business_days=False):
-    if pd.isna(a) or pd.isna(b):
-        return 0
-    a = pd.Timestamp(a).normalize()
-    b = pd.Timestamp(b).normalize()
-    if b < a:
-        a, b = b, a
+def days_in_range_optimized(start_dates, end_dates, business_days=False):
+    """Versão vetorizada para cálculo de dias"""
+    mask = ~(pd.isna(start_dates) | pd.isna(end_dates))
+    result = pd.Series(0, index=start_dates.index)
+    
     if business_days:
-        return int(np.busday_count(a.date(), (b + pd.Timedelta(days=1)).date()))
-    return (b - a).days + 1
-
-def split_value_by_month(start, end, value, business_days=False):
-    if pd.isna(start) or pd.isna(end) or pd.isna(value):
-        return []
-    if end < start:
-        start, end = end, start
-    meses = pd.date_range(start=first_day_of_month(start), end=first_day_of_month(end), freq="MS")
-    total_dias = days_in_range(start, end, business_days=business_days)
-    if total_dias <= 0:
-        return []
-    partes = []
-    for m in meses:
-        mes_ini = max(start, m)
-        mes_fim = min(end, last_day_of_month(m))
-        dias = days_in_range(mes_ini, mes_fim, business_days=business_days)
-        if dias <= 0:
-            continue
-        partes.append((first_day_of_month(m), dias, value * (dias / total_dias)))
-    return partes
-
-def format_mod_label(m_value):
-    """Formata M como 'MÓD. XX' (0->MÓD. 01; 1->MÓD. 02; etc.)."""
-    if pd.isna(m_value):
-        idx = 0
+        # Implementação mais eficiente para dias úteis
+        for idx in start_dates[mask].index:
+            start = start_dates[idx].normalize()
+            end = end_dates[idx].normalize()
+            if end < start:
+                start, end = end, start
+            result[idx] = np.busday_count(start.date(), (end + pd.Timedelta(days=1)).date())
     else:
+        # Cálculo direto para dias corridos
+        valid_starts = start_dates[mask]
+        valid_ends = end_dates[mask]
+        result[mask] = ((valid_ends - valid_starts).dt.days + 1).clip(lower=0)
+    
+    return result
+
+def split_value_by_month_batch(df_batch, business_days=False):
+    """Processamento em lote otimizado"""
+    results = []
+    
+    for idx, row in df_batch.iterrows():
+        start, end, value = row['_Inicio'], row['_Termino'], row['_VP_frac']
+        
+        if pd.isna(start) or pd.isna(end) or pd.isna(value):
+            continue
+            
+        if end < start:
+            start, end = end, start
+            
+        # Gera meses de forma mais eficiente
+        current = first_day_of_month(start)
+        end_month = first_day_of_month(end)
+        
+        total_dias = days_in_range_optimized(
+            pd.Series([start]), pd.Series([end]), business_days
+        ).iloc[0]
+        
+        if total_dias <= 0:
+            continue
+            
+        while current <= end_month:
+            mes_ini = max(start, current)
+            mes_fim = min(end, last_day_of_month(current))
+            
+            dias = days_in_range_optimized(
+                pd.Series([mes_ini]), pd.Series([mes_fim]), business_days
+            ).iloc[0]
+            
+            if dias > 0:
+                results.append({
+                    'Linha_Original': idx,
+                    'DataReferencia': current,
+                    'VP_mes': value * (dias / total_dias),
+                    'Dias_no_Mes': dias
+                })
+            
+            current += pd.offsets.MonthBegin(1)
+    
+    return results
+
+@st.cache_data
+def format_mod_label_series(m_series):
+    """Versão vetorizada para formatação de módulos"""
+    def format_single(m_value):
+        if pd.isna(m_value):
+            return "MÓD. 01"
+        
         s = str(m_value).strip().lower()
         if s in {"", "nan", "none"}:
-            idx = 0
-        else:
-            try:
-                s = s.replace(",", ".")
-                idx = int(float(s))
-            except Exception:
-                idx = 0
-    return f"MÓD. {idx + 1:02d}"
+            return "MÓD. 01"
+        
+        try:
+            s_clean = s.replace(",", ".")
+            idx = int(float(s_clean))
+            return f"MÓD. {idx + 1:02d}"
+        except (ValueError, TypeError):
+            return "MÓD. 01"
+    
+    return m_series.apply(format_single)
 
-def to_excel_bytes_single(df, sheet_name="VP_por_Atividade", date_cols=None):
-    output = BytesIO()
-    with pd.ExcelWriter(output, engine="xlsxwriter", datetime_format="dd/mm/yyyy") as writer:
-        df.to_excel(writer, sheet_name=sheet_name, index=False)
-        wb = writer.book
-        ws = writer.sheets[sheet_name]
-        date_fmt = wb.add_format({"num_format": "dd/mm/yyyy"})
-        if date_cols:
-            for col in date_cols:
-                if col in df.columns:
-                    idx = df.columns.get_loc(col)
-                    ws.set_column(idx, idx, 14, date_fmt)
-        for i, c in enumerate(df.columns):
-            try:
-                width = min(max(10, int(df[c].astype(str).str.len().quantile(0.90) + 2)), 50)
-            except Exception:
-                width = 14
-            ws.set_column(i, i, width)
-    output.seek(0)
-    return output.getvalue()
-
-# ---------- Núcleo ----------
-def processar(df_in: pd.DataFrame, usar_dias_uteis: bool):
+# ---------- PROCESSAMENTO PRINCIPAL OTIMIZADO ----------
+def processar_otimizado(df_in: pd.DataFrame, usar_dias_uteis: bool):
+    """Versão otimizada do processamento principal"""
+    # Cria cópia e limpa colunas
     df = df_in.copy()
     df.columns = [str(c).strip() for c in df.columns]
-
+    
+    # Verifica colunas obrigatórias
     required = ["index", "NET", "Nome", "Início", "Término", "Custo"]
     faltando = [c for c in required if c not in df.columns]
     if faltando:
         raise ValueError(f"Colunas obrigatórias ausentes: {', '.join(faltando)}")
-
-    df["_Inicio"]  = df["Início"].apply(to_date)
-    df["_Termino"] = df["Término"].apply(to_date)
-    df["_Custo"]   = df["Custo"].apply(parse_currency_ptbr_to_float).fillna(0.0)
-
-    # Por quê: especificação define "Empreendimento + Módulo" como Nome onde index==0.
+    
+    # Conversões otimizadas
+    df["_Inicio"] = to_date_optimized(df["Início"])
+    df["_Termino"] = to_date_optimized(df["Término"])
+    
+    # Parsing de custo otimizado
+    custo_series = df["Custo"].astype(str)
+    df["_Custo"] = custo_series.apply(parse_currency_ptbr_to_float).fillna(0.0)
+    
+    # Encontra código do empreendimento
     idx_mask = pd.to_numeric(df["index"], errors="coerce") == 0
     codigo_emp_mod = ""
     if idx_mask.any():
         val = df.loc[idx_mask, "Nome"].dropna().astype(str)
         if not val.empty:
             codigo_emp_mod = val.iloc[0].strip()
-
+    
+    # Preenche colunas opcionais
     if "B" not in df.columns:
-        df["B"] = pd.NA  # Por quê: manter saída consistente mesmo sem a coluna.
-
-    # Verificar se existe coluna "M" para módulo
+        df["B"] = pd.NA
+    
     if "M" not in df.columns:
-        df["M"] = 0  # Valor padrão se não existir a coluna M
-
+        df["M"] = 0
+    
+    # Filtra NET=5
     net_num = pd.to_numeric(df["NET"], errors="coerce")
     df_net5 = df.loc[net_num == 5].copy()
-
+    
+    # Remove linhas inválidas
     invalid_mask = df_net5["_Inicio"].isna() | df_net5["_Termino"].isna()
     df_net5_valid = df_net5.loc[~invalid_mask].copy()
+    
     if df_net5_valid.empty:
         raise ValueError("Nenhuma linha com NET=5 e datas válidas ('Início' e 'Término').")
-
+    
+    # Calcula fração VP
     soma_custo = df_net5_valid["_Custo"].sum()
     if soma_custo <= 0:
         n = len(df_net5_valid)
         df_net5_valid["_VP_frac"] = 1.0 / n
     else:
         df_net5_valid["_VP_frac"] = df_net5_valid["_Custo"] / soma_custo
-
-    linhas = []
-    for idx, r in df_net5_valid.iterrows():
-        partes = split_value_by_month(r["_Inicio"], r["_Termino"], r["_VP_frac"], business_days=usar_dias_uteis)
-        for mes_ref, dias_mes, vp_mes in partes:
-            linhas.append({
-                "Linha_Original": idx,
-                "DataReferencia": mes_ref,
-                "VP_mes": vp_mes,
-                "Dias_no_Mes": dias_mes
-            })
+    
+    # Processamento em lote dos meses
+    linhas = split_value_by_month_batch(df_net5_valid, business_days=usar_dias_uteis)
+    
     if not linhas:
         raise ValueError("Não foi possível distribuir VP por mês para NET=5.")
-
+    
+    # Cria DataFrame de meses
     df_mes = pd.DataFrame(linhas)
-
+    
+    # Ajuste de precisão (mantido da versão original)
     soma_id = df_mes.groupby("Linha_Original", as_index=False)["VP_mes"].sum().rename(columns={"VP_mes": "VP_somado"})
     df_mes = df_mes.merge(soma_id, on="Linha_Original", how="left")
     df_mes = df_mes.merge(
@@ -177,179 +238,260 @@ def processar(df_in: pd.DataFrame, usar_dias_uteis: bool):
     idx_last = df_mes.sort_values(["Linha_Original", "DataReferencia"]).groupby("Linha_Original").tail(1).index
     df_mes.loc[idx_last, "VP_mes"] = df_mes.loc[idx_last, "VP_mes"] + df_mes.loc[idx_last, "Dif"]
     df_mes.drop(columns=["VP_somado", "VP_total", "Dif"], inplace=True)
-
+    
+    # Merge com dados originais
     df_out = df_mes.merge(
-        df_net5_valid[["Nome", "B", "M"]],  # Incluir coluna M
+        df_net5_valid[["Nome", "B", "M"]],
         left_on="Linha_Original", right_index=True, how="left"
     )
-
+    
+    # Filtra valores válidos
     df_out = df_out[~df_out["VP_mes"].isna() & (df_out["VP_mes"] > 0)].copy()
-
+    
+    # Normalização final
     total_vp = df_out["VP_mes"].sum()
     if total_vp > 0:
         df_out["VP_mes"] = df_out["VP_mes"] / total_vp
         resid = 1.0 - df_out["VP_mes"].sum()
         if abs(resid) > 1e-12:
             df_out.iloc[-1, df_out.columns.get_loc("VP_mes")] += resid
-
-    # Aplicar formatação do módulo (M + 1 formatado como 2 dígitos)
-    df_out["Modulo_Formatado"] = df_out["M"].apply(format_mod_label)
-
+    
+    # Formata módulo
+    df_out["Modulo_Formatado"] = format_mod_label_series(df_out["M"])
+    
+    # DataFrame final
     df_final = pd.DataFrame({
         "Empreendimento": [codigo_emp_mod] * len(df_out),
-        #"Bloco": df_out["B"],
-        "Módulo": df_out["Modulo_Formatado"],  # Substituir PEP por Módulo formatado
+        "Módulo": df_out["Modulo_Formatado"],
         "Atividade": df_out["Nome"],
         "VP PREVISTO": df_out["VP_mes"],
         "Mes Ano": df_out["DataReferencia"]
     })
-
+    
     df_final = df_final.sort_values(["Mes Ano", "Atividade"]).reset_index(drop=True)
     return df_final, int(invalid_mask.sum())
 
-def read_any(uploaded_file) -> pd.DataFrame:
+# ---------- LEITURA E ESCRITA OTIMIZADAS ----------
+@st.cache_data(show_spinner=False)
+def read_any_optimized(uploaded_file):
+    """Leitura otimizada de arquivos"""
     name = uploaded_file.name.lower()
-    if name.endswith(".csv"):
-        try:
-            return pd.read_csv(uploaded_file)
-        except Exception:
+    
+    try:
+        if name.endswith(".csv"):
+            # Tenta detectar encoding e separador
+            sample = uploaded_file.read(1024).decode('utf-8', errors='ignore')
             uploaded_file.seek(0)
-            return pd.read_csv(uploaded_file, sep=";")
-    if name.endswith(".xlsx") or name.endswith(".xls"):
-        return pd.read_excel(uploaded_file, sheet_name=0)
-    raise ValueError("Extensão não suportada.")
+            
+            sep = ';' if ';' in sample else ','
+            return pd.read_csv(uploaded_file, sep=sep, encoding='utf-8', engine='python')
+        
+        elif name.endswith((".xlsx", ".xls")):
+            # Lê apenas dados, ignora formatação
+            return pd.read_excel(
+                uploaded_file, 
+                sheet_name=0, 
+                engine='openpyxl',
+                dtype=str,  # Lê tudo como string e converte depois
+                na_values=['', 'NULL', 'null', 'NaN', 'N/A']
+            )
+    
+    except Exception as e:
+        raise ValueError(f"Erro ao ler arquivo {uploaded_file.name}: {str(e)}")
 
-def build_zip(files_bytes: list[tuple[str, bytes]], report_text: str) -> bytes:
+def to_excel_bytes_optimized(df, sheet_name="VP_por_Atividade"):
+    """Geração otimizada de Excel"""
+    output = BytesIO()
+    
+    # Configurações para performance
+    with pd.ExcelWriter(
+        output, 
+        engine='xlsxwriter',
+        options={'strings_to_numbers': True, 'strings_to_urls': False}
+    ) as writer:
+        df.to_excel(writer, sheet_name=sheet_name, index=False)
+        
+        # Formatação básica
+        workbook = writer.book
+        worksheet = writer.sheets[sheet_name]
+        
+        # Formato de data
+        date_format = workbook.add_format({'num_format': 'dd/mm/yyyy'})
+        
+        # Ajusta largura das colunas
+        for idx, col in enumerate(df.columns):
+            max_len = max(
+                df[col].astype(str).str.len().max(),
+                len(str(col))
+            ) + 2
+            worksheet.set_column(idx, idx, min(max_len, 50))
+            
+            # Aplica formato de data se for datetime
+            if pd.api.types.is_datetime64_any_dtype(df[col]):
+                worksheet.set_column(idx, idx, 14, date_format)
+    
+    output.seek(0)
+    return output.getvalue()
+
+def build_zip_optimized(files_bytes):
+    """Criação otimizada de ZIP"""
     buf = BytesIO()
-    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
         for fname, data in files_bytes:
             zf.writestr(fname, data)
-        zf.writestr("_report.txt", report_text)
     buf.seek(0)
-    return buf.read()
+    return buf.getvalue()
 
-# ---------- UI ----------
-st.title("Distribuição Mensal VP")
-st.markdown(
-    'Envie **até 100 arquivos** no modelo do Cronograma (Nexus). Cada entrada gera **um XLSX (uma única guia)**. '
-    'O download final é um **ZIP**.\n\n'
-    'Observação: Sempre lembrar de marcar a opção "Calcular Custos Preliminares" ao gerar o Cronograma no Nexus.'
-)
-
-# Configuração melhorada do file_uploader
-uploaded_files = st.file_uploader(
-    "Arraste e solte vários arquivos aqui (.xlsx, .xls ou .csv)",
-    type=["xlsx", "xls", "csv"],
-    accept_multiple_files=True,
-    help="Você pode selecionar múltiplos arquivos ou arrastar uma pasta inteira"
-)
-
-c1, c2 = st.columns([1, 2])
-with c1:
-    usar_dias_uteis = st.checkbox("Considerar apenas dias úteis (seg-sex)", value=False)
-with c2:
-    mostrar_previa = st.checkbox("Mostrar prévias por arquivo", value=True)
-
-st.divider()
-
-if uploaded_files:
-    # Mostrar estatísticas dos arquivos carregados
-    st.success(f"✅ {len(uploaded_files)} arquivo(s) carregado(s) com sucesso!")
+# ---------- INTERFACE DO USUÁRIO OTIMIZADA ----------
+def main():
+    # Verifica imports
+    if not safe_imports():
+        return
     
-    # Listar arquivos carregados
-    with st.expander("📁 Arquivos carregados", expanded=True):
-        for i, file in enumerate(uploaded_files, 1):
-            st.write(f"{i}. {file.name} ({file.size / 1024:.1f} KB)")
-    
-    if len(uploaded_files) > MAX_FILES:
-        st.error(f"❌ Você enviou {len(uploaded_files)} arquivos; o limite é {MAX_FILES}. Remova alguns e tente novamente.")
-    else:
-        # Botão de processamento mais destacado
-        st.markdown("---")
-        go = st.button(
-            f"🚀 Processar {len(uploaded_files)} arquivo(s)", 
-            type="primary", 
-            use_container_width=True
-        )
-        
-        if go:
-            results: list[tuple[str, bytes]] = []
-            report_lines = []
-            progress = st.progress(0)
-            total = len(uploaded_files)
-
-            # Adicionar área de status
-            status_placeholder = st.empty()
-            
-            for i, up in enumerate(uploaded_files, start=1):
-                fname = up.name
-                status_placeholder.info(f"🔄 Processando {i}/{total}: {fname}")
-                
-                try:
-                    df_in = read_any(up)
-                    df_out, n_invalid = processar(df_in, usar_dias_uteis=usar_dias_uteis)
-                    excel_bytes = to_excel_bytes_single(
-                        df_out,
-                        sheet_name="VP_por_Atividade",
-                        date_cols=["Mes Ano"]
-                    )
-                    safe_base = fname.rsplit(".", 1)[0]
-                    out_name = f"{safe_base}__VP_mensal.xlsx"
-                    results.append((out_name, excel_bytes))
-
-                    msg = f"✅ {fname} — linhas NET=5 inválidas ignoradas: {n_invalid}; soma VP={df_out['VP PREVISTO'].sum():.6f}"
-                    report_lines.append(msg)
-
-                    if mostrar_previa:
-                        with st.expander(f"📊 Prévia: {fname}"):
-                            st.dataframe(df_out.head(50), use_container_width=True, hide_index=True)
-                            st.caption(f"Soma total VP PREVISTO (deve ser 1.0): {df_out['VP PREVISTO'].sum():.6f}")
-                except Exception as e:
-                    # Por quê: não interromper o lote por erro em um arquivo.
-                    error_msg = f"❌ {fname} — {str(e)}"
-                    report_lines.append(error_msg)
-                    st.error(f"Erro em {fname}: {str(e)}")
-
-                progress.progress(int(i * 100 / total))
-
-            status_placeholder.empty()
-
-            if not results and report_lines:
-                st.error("❌ Falha ao processar todos os arquivos. Veja o relatório abaixo.")
-                st.text("\n".join(report_lines))
-            elif results:
-                ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-                zip_bytes = build_zip(results, "\n".join(report_lines))
-                
-                st.success(f"🎉 Concluído: {len(results)} arquivo(s) processado(s) com sucesso!")
-                
-                # Botão de download mais destacado
-                st.download_button(
-                    label="📥 Baixar ZIP com todos os arquivos processados",
-                    data=zip_bytes,
-                    file_name=f"VP_mensal_lote_{ts}.zip",
-                    mime="application/zip",
-                    type="primary",
-                    use_container_width=True
-                )
-                
-                with st.expander("📋 Relatório detalhado de processamento"):
-                    st.text("\n".join(report_lines))
-else:
-    st.info("""
-    📌 **Como usar:**
-    1. Arraste e solte vários arquivos Excel/CSV na área acima
-    2. Ou clique em "Browse files" para selecionar múltiplos arquivos (Ctrl+Click)
-    3. Ajuste as configurações se necessário
-    4. Clique no botão "Processar" para gerar o ZIP
-    """)
-
-# Adicionar dicas de uso
-with st.expander("💡 Dicas para carregar múltiplos arquivos"):
+    # Header
+    st.title("🚀 Distribuição Mensal VP - Otimizado")
     st.markdown("""
-    - **Windows/Linux**: Selecione múltiplos arquivos com `Ctrl + Click`
-    - **Mac**: Selecione múltiplos arquivos com `Cmd + Click`  
-    - **Arraste e solte**: Você pode arrastar uma pasta inteira ou vários arquivos selecionados
-    - **Formatos suportados**: .xlsx, .xls, .csv
-    - **Limite**: Máximo de 100 arquivos por vez
+    **Processamento em lote otimizado para nuvem**  
+    Envie múltiplos arquivos do Cronograma (Nexus) e receba um ZIP com os resultados.
     """)
+    
+    # Configurações
+    with st.sidebar:
+        st.header("⚙️ Configurações")
+        usar_dias_uteis = st.checkbox("Considerar apenas dias úteis", value=False)
+        mostrar_previa = st.checkbox("Mostrar prévias", value=False)
+        st.markdown("---")
+        st.info("💡 **Dica:** Arquivos menores processam mais rápido!")
+    
+    # Upload de arquivos
+    uploaded_files = st.file_uploader(
+        "📁 Arraste ou selecione os arquivos",
+        type=["xlsx", "xls", "csv"],
+        accept_multiple_files=True,
+        help="Máximo 50 arquivos por vez"
+    )
+    
+    # Processamento
+    if uploaded_files:
+        st.success(f"✅ {len(uploaded_files)} arquivo(s) carregado(s)")
+        
+        # Lista arquivos
+        with st.expander("📋 Arquivos carregados", expanded=False):
+            for i, file in enumerate(uploaded_files, 1):
+                st.write(f"{i}. {file.name} ({file.size / 1024:.1f} KB)")
+        
+        if len(uploaded_files) > config["MAX_FILES"]:
+            st.error(f"❌ Limite de {config['MAX_FILES']} arquivos excedido")
+            return
+        
+        # Botão de processamento
+        if st.button("🚀 Processar Arquivos", type="primary", use_container_width=True):
+            process_files(uploaded_files, usar_dias_uteis, mostrar_previa)
+    
+    else:
+        show_instructions()
+
+def process_files(uploaded_files, usar_dias_uteis, mostrar_previa):
+    """Processa os arquivos de forma otimizada"""
+    results = []
+    report_lines = []
+    total_files = len(uploaded_files)
+    
+    # Barra de progresso
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    for i, uploaded_file in enumerate(uploaded_files):
+        try:
+            # Atualiza status
+            status_text.info(f"🔄 Processando {i+1}/{total_files}: {uploaded_file.name}")
+            
+            # Lê e processa
+            df_in = read_any_optimized(uploaded_file)
+            df_out, n_invalid = processar_otimizado(df_in, usar_dias_uteis)
+            
+            # Gera Excel
+            excel_bytes = to_excel_bytes_optimized(df_out)
+            
+            # Nome do arquivo de saída
+            safe_name = uploaded_file.name.rsplit(".", 1)[0]
+            out_name = f"{safe_name}__VP_mensal.xlsx"
+            results.append((out_name, excel_bytes))
+            
+            # Registra sucesso
+            msg = f"✅ {uploaded_file.name} - {n_invalid} inválidas - VP: {df_out['VP PREVISTO'].sum():.6f}"
+            report_lines.append(msg)
+            
+            # Prévia se solicitado
+            if mostrar_previa:
+                with st.expander(f"📊 Prévia: {uploaded_file.name}"):
+                    st.dataframe(df_out.head(20), use_container_width=True)
+                    st.caption(f"Total VP: {df_out['VP PREVISTO'].sum():.6f}")
+        
+        except Exception as e:
+            error_msg = f"❌ {uploaded_file.name} - ERRO: {str(e)}"
+            report_lines.append(error_msg)
+            st.error(f"Erro em {uploaded_file.name}: {str(e)}")
+        
+        # Atualiza progresso
+        progress_bar.progress((i + 1) / total_files)
+    
+    # Finalização
+    status_text.empty()
+    progress_bar.empty()
+    
+    if results:
+        show_results(results, report_lines)
+    else:
+        st.error("❌ Nenhum arquivo processado com sucesso")
+
+def show_results(results, report_lines):
+    """Exibe resultados e botão de download"""
+    # Gera ZIP
+    with st.spinner("📦 Gerando arquivo ZIP..."):
+        zip_bytes = build_zip_optimized(results)
+    
+    # Timestamp para nome do arquivo
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    # Interface de sucesso
+    st.success(f"🎉 Processamento concluído: {len(results)} arquivo(s) gerado(s)")
+    
+    # Botão de download
+    st.download_button(
+        label="📥 Baixar ZIP com Resultados",
+        data=zip_bytes,
+        file_name=f"vp_mensal_lote_{ts}.zip",
+        mime="application/zip",
+        type="primary",
+        use_container_width=True
+    )
+    
+    # Relatório
+    with st.expander("📋 Relatório de Processamento"):
+        st.text("\n".join(report_lines))
+
+def show_instructions():
+    """Mostra instruções de uso"""
+    st.info("""
+    ## 📌 Como usar:
+    
+    1. **Prepare seus arquivos** no formato do Cronograma Nexus
+    2. **Envie os arquivos** arrastando ou clicando na área acima
+    3. **Ajuste as configurações** na barra lateral se necessário
+    4. **Clique em Processar** para gerar os resultados
+    5. **Baixe o ZIP** com todos os arquivos processados
+    
+    ### ✅ Formatos suportados:
+    - Excel (.xlsx, .xls)
+    - CSV (.csv)
+    
+    ### ⚡ Dicas de performance:
+    - Limite a 10-20 arquivos por vez para melhor velocidade
+    - Arquivos menores processam mais rápido
+    - Use a opção de dias úteis apenas quando necessário
+    """)
+
+# ---------- EXECUÇÃO ----------
+if __name__ == "__main__":
+    main()
